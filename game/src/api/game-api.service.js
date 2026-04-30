@@ -1,59 +1,101 @@
-// Servicio de comunicación con el backend — CON VULNERABILIDADES
+// Servicio seguro de comunicación con el backend de PixelForge Studio
 
-const API_BASE = 'https://pixelforge-grupoN.lab.umng.edu.co/api';
+const API_BASE = 'https://danielmiguel.si-umng.com/api';
 
 export class GameApiService {
   constructor() {
-    // ← VULNERABLE: token en propiedad pública
-    this.jwtToken = localStorage.getItem('jwt') || null;
-    console.log('[DEBUG] Token cargado:', this.jwtToken);  // ← expone token en consola
+    this.jwtToken = sessionStorage.getItem('jwt') || null;
   }
 
-  async login(email, password) {
-    const data = await fetch(`${API_BASE}/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password })
-    }).then(r => r.json());
-    this.jwtToken = data.token;
-    localStorage.setItem('jwt', data.token);
+  getAuthHeaders() {
+    if (!this.jwtToken) {
+      return {};
+    }
+
+    return {
+      Authorization: `Bearer ${this.jwtToken}`
+    };
+  }
+
+  async handleResponse(response) {
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(data.detail || 'Error en la comunicación con el servidor.');
+    }
+
     return data;
   }
 
-  async iniciarPartida() {
-    return fetch(`${API_BASE}/game/start`, {
+  async login(email, password) {
+    const response = await fetch(`${API_BASE}/auth/login`, {
       method: 'POST',
-      // ← VULNERABLE: sin prefijo Bearer
-      headers: { Authorization: this.jwtToken }
-    }).then(r => r.json());
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password })
+    });
+
+    const data = await this.handleResponse(response);
+
+    if (data.token) {
+      this.jwtToken = data.token;
+      sessionStorage.setItem('jwt', data.token);
+    }
+
+    return data;
   }
 
-  async registrarPuntuacion(score, levelReached, sessionToken) {
-    // ← VULNERABLE: score calculado en el cliente y enviado directamente
-    const finalScore = score + (levelReached * 500);
+  logout() {
+    this.jwtToken = null;
+    sessionStorage.removeItem('jwt');
+  }
 
-    return fetch(`${API_BASE}/game/end`, {
+  async iniciarPartida() {
+    const response = await fetch(`${API_BASE}/game/start`, {
+      method: 'POST',
+      headers: {
+        ...this.getAuthHeaders()
+      }
+    });
+
+    return this.handleResponse(response);
+  }
+
+  async registrarPuntuacion(levelReached, sessionToken, stats = {}) {
+    /*
+      Control seguro:
+      El cliente NO envía score final.
+      Solo envía estadísticas limitadas.
+      El backend calcula el score real.
+    */
+    const payload = {
+      session_token: sessionToken,
+      level_reached: Number(levelReached),
+      coins_collected: Number(stats.coinsCollected || 0),
+      enemies_defeated: Number(stats.enemiesDefeated || 0),
+      time_remaining: Number(stats.timeRemaining || 0)
+    };
+
+    const response = await fetch(`${API_BASE}/game/end`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: this.jwtToken       // ← sin Bearer
+        ...this.getAuthHeaders()
       },
-      body: JSON.stringify({
-        score: finalScore,                 // ← score del cliente
-        level_reached: levelReached,
-        session_token: sessionToken
-      })
-    }).then(r => r.json());
+      body: JSON.stringify(payload)
+    });
+
+    return this.handleResponse(response);
   }
 
-  async obtenerLeaderboard() {
-    // ← VULNERABLE: sin limite — descarga todo
-    return fetch(`${API_BASE}/leaderboard?limit=999999`).then(r => r.json());
+  async obtenerLeaderboard(limit = 10) {
+    const safeLimit = Math.min(Math.max(Number(limit) || 10, 1), 50);
+
+    const response = await fetch(`${API_BASE}/leaderboard?limit=${safeLimit}`, {
+      method: 'GET'
+    });
+
+    return this.handleResponse(response);
   }
 }
 
-// ← VULNERABLE: funcion de debug global
-window.debugSetScore = (score) => {
-  console.log('Forzando score:', score);
-  window.gameApi.registrarPuntuacion(score, 3, 'debug-token');
-};
+export const gameApi = new GameApiService();
