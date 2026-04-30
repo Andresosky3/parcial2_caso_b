@@ -1,4 +1,4 @@
-"""Servicio de autenticación seguro para PixelForge Studio."""
+ï»¿"""Servicio de autenticacion seguro para PixelForge Studio."""
 
 import os
 import re
@@ -16,7 +16,7 @@ JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "60"))
 
 if not JWT_SECRET:
     raise RuntimeError(
-        "JWT_SECRET_KEY no está configurado. Defina esta variable en el entorno o en el archivo .env."
+        "JWT_SECRET_KEY no esta configurado. Defina esta variable en el entorno o en el archivo .env."
     )
 
 
@@ -35,11 +35,11 @@ PASSWORD_REGEX = re.compile(
 
 def validate_password_strength(password: str) -> None:
     """
-    Valida la complejidad mínima de la contraseña en backend.
+    Valida la complejidad minima de la contrasena en backend.
     """
     if not PASSWORD_REGEX.match(password):
         raise ValueError(
-            "La contraseña no cumple los requisitos mínimos de seguridad."
+            "La contrasena no cumple los requisitos minimos de seguridad."
         )
 
 
@@ -53,7 +53,7 @@ def hash_password(password: str) -> str:
 
 def verify_password(plain: str, hashed: str) -> bool:
     """
-    Verifica una contraseña usando bcrypt.
+    Verifica una contrasena usando bcrypt.
     """
     try:
         return pwd_context.verify(plain, hashed)
@@ -102,7 +102,7 @@ def decode_token(token: str) -> Dict[str, Any]:
         return payload
 
     except JWTError:
-        raise ValueError("Token inválido o expirado")
+        raise ValueError("Token invalido o expirado")
 
 
 def blacklist_token(token: str) -> None:
