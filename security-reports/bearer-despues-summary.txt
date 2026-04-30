@@ -1,0 +1,10 @@
+Bearer Backend DESPUES
+
+Critical: 0
+High: 0
+Medium: 0
+Low: 0
+Warning: 0
+
+Resultado:
+Bearer no reporto hallazgos de seguridad en el backend despues de las correcciones.
