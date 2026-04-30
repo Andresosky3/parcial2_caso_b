@@ -1,0 +1,17 @@
+Bearer Frontend ANTES
+
+Critical: 0
+High: 0
+Medium: 0
+Low: 0
+Warning: 0
+
+Resultado:
+Bearer no reportó hallazgos de seguridad en el frontend durante el escaneo inicial.
+
+Archivo analizado:
+frontend/src
+
+Evidencia relacionada:
+bearer-frontend-antes.html
+bearer-frontend-antes.json
