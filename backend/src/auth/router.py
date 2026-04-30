@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from src.auth.service import (
     create_token,
@@ -27,6 +27,7 @@ DUMMY_HASH = (
 
 
 class RegisterBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     nickname: str = Field(
         ...,
         min_length=3,
@@ -38,6 +39,7 @@ class RegisterBody(BaseModel):
 
 
 class LoginBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     email: EmailStr
     password: str = Field(..., min_length=8, max_length=128)
 

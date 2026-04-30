@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.auth.rbac import verify_role
 
@@ -18,6 +18,7 @@ MAX_SESSION_MINUTES = 30
 
 
 class EndGameBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     session_token: str = Field(..., min_length=20, max_length=80)
     level_reached: int = Field(..., ge=1, le=10)
     coins_collected: int = Field(default=0, ge=0, le=500)
