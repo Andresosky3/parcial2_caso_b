@@ -1,6 +1,6 @@
 // Servicio seguro de comunicación con el backend de PixelForge Studio
 
-const API_BASE = 'https://danielmiguel.si-umng.com/api';
+const API_BASE = '/api';
 
 export class GameApiService {
   constructor() {
