@@ -3,14 +3,16 @@
 import os
 import re
 import uuid
+from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 
-
+load_dotenv()
 JWT_SECRET = os.getenv("JWT_SECRET_KEY")
+
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "60"))
 
