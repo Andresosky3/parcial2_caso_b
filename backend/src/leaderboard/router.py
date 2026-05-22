@@ -1,74 +1,119 @@
-"""Leaderboard seguro para PixelForge Studio."""
+"""Ranking global seguro para PixelForge Studio."""
 
-import sqlite3
-from html import escape
+from datetime import datetime, timedelta
+from typing import Dict, Tuple
 
 from fastapi import APIRouter, Query
 
-router = APIRouter()
-
-DB_PATH = "game.db"
+from src.db import fetch, fetchval
 
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+router = APIRouter(tags=["leaderboard"])
+
+
+CACHE_TTL_SECONDS = 30
+_leaderboard_cache: Dict[Tuple[int, int], dict] = {}
+
+
+def get_cache_key(page: int, limit: int) -> Tuple[int, int]:
+    return page, limit
+
+
+def is_cache_valid(cached_at: datetime) -> bool:
+    return datetime.utcnow() - cached_at < timedelta(seconds=CACHE_TTL_SECONDS)
+
+
+async def build_leaderboard(page: int, limit: int) -> dict:
+    offset = (page - 1) * limit
+
+    total_players = await fetchval(
+        """
+        SELECT COUNT(*)
+        FROM (
+            SELECT jugador_id
+            FROM puntuaciones
+            WHERE estado = 'valida'
+            GROUP BY jugador_id
+        ) AS grouped_scores
+        """
+    )
+
+    rows = await fetch(
+        """
+        WITH best_scores AS (
+            SELECT jugador_id, MAX(score) AS best_score
+            FROM puntuaciones
+            WHERE estado = 'valida'
+            GROUP BY jugador_id
+        ),
+        ranked_scores AS (
+            SELECT
+                ROW_NUMBER() OVER (ORDER BY best_score DESC, j.nickname ASC) AS position,
+                j.nickname AS nickname,
+                best_score AS score
+            FROM best_scores bs
+            INNER JOIN jugadores j ON j.id = bs.jugador_id
+            WHERE j.estado = 'activo'
+        )
+        SELECT position, nickname, score
+        FROM ranked_scores
+        ORDER BY position
+        LIMIT $1 OFFSET $2
+        """,
+        limit,
+        offset,
+    )
+
+    rankings = [
+        {
+            "position": row["position"],
+            "nickname": row["nickname"],
+            "score": row["score"],
+        }
+        for row in rows
+    ]
+
+    return {
+        "page": page,
+        "limit": limit,
+        "total_players": int(total_players or 0),
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
+        "cached": False,
+        "rankings": rankings,
+    }
 
 
 @router.get("/leaderboard")
-def leaderboard(
-    limit: int = Query(
-        default=10,
-        ge=1,
-        le=50,
-        description="Cantidad máxima de posiciones a consultar. Máximo permitido: 50."
-    )
+@router.get("/api/leaderboard")
+async def leaderboard(
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=10, ge=1, le=50),
 ):
     """
-    Consulta el ranking global de jugadores.
+    Ranking público.
 
-    Controles implementados:
-    - limit validado con mínimo 1 y máximo 50.
-    - consulta SQL parametrizada.
-    - solo se muestran puntuaciones con estado 'valida'.
-    - se escapa nickname antes de responder para reducir riesgo de XSS reflejado.
+    Reglas:
+    - No requiere autenticación.
+    - No expone email.
+    - No expone ID interno.
+    - Implementa paginación.
+    - limit máximo 50.
+    - Cache TTL 30 segundos.
     """
-    conn = get_conn()
 
-    try:
-        rows = conn.execute(
-            """
-            SELECT
-                j.nickname AS nickname,
-                MAX(p.score) AS best,
-                MAX(p.level_reached) AS lvl
-            FROM puntuaciones p
-            JOIN jugadores j ON j.id = p.jugador_id
-            WHERE p.estado = ?
-            GROUP BY j.id, j.nickname
-            ORDER BY best DESC
-            LIMIT ?
-            """,
-            ("valida", limit),
-        ).fetchall()
+    cache_key = get_cache_key(page, limit)
+    cached = _leaderboard_cache.get(cache_key)
 
-        rankings = []
+    if cached and is_cache_valid(cached["cached_at"]):
+        data = cached["data"].copy()
+        data["cached"] = True
+        return data
 
-        for index, row in enumerate(rows, start=1):
-            rankings.append(
-                {
-                    "position": index,
-                    "nickname": escape(row["nickname"]),
-                    "score": int(row["best"]),
-                    "level_reached": int(row["lvl"]),
-                }
-            )
+    data = await build_leaderboard(page, limit)
 
-        return {
-            "limit": limit,
-            "rankings": rankings,
-        }
+    _leaderboard_cache[cache_key] = {
+        "cached_at": datetime.utcnow(),
+        "data": data,
+    }
 
-    finally:
-        conn.close()
+    return data

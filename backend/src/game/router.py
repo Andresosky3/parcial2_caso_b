@@ -1,45 +1,49 @@
-"""Rutas seguras de juego y anti-cheat para PixelForge Studio."""
+"""Rutas de juego y registro seguro de puntajes."""
 
-import json
-import sqlite3
-import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Dict
+from datetime import datetime, timedelta
+from typing import Optional
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.auth.rbac import verify_role
-
-router = APIRouter()
-
-DB_PATH = "game.db"
-MAX_SESSION_MINUTES = 30
+from src.auth.rbac import require_role
+from src.db import execute, fetchrow, fetchval
+from src.security_logger import log_security_event
 
 
-class EndGameBody(BaseModel):
+router = APIRouter(prefix="/game", tags=["game"])
+
+
+MAX_SCORE_ALLOWED = 100000
+SCORE_RATE_LIMIT_SECONDS = 60
+
+
+class StartGameResponse(BaseModel):
+    session_token: str
+    message: str
+
+
+class ScoreBody(BaseModel):
+    """
+    Body permitido para registrar puntaje.
+
+    Importante:
+    - No existe player_id en el body.
+    - Si el cliente envía player_id, Pydantic lo rechaza por extra='forbid'.
+    """
+
     model_config = ConfigDict(extra="forbid")
-    session_token: str = Field(..., min_length=20, max_length=80)
-    level_reached: int = Field(..., ge=1, le=10)
-    coins_collected: int = Field(default=0, ge=0, le=500)
-    enemies_defeated: int = Field(default=0, ge=0, le=200)
-    time_remaining: int = Field(default=0, ge=0, le=600)
+
+    score: int = Field(ge=1, le=MAX_SCORE_ALLOWED)
+    level_reached: int = Field(ge=1, le=10)
+    session_token: Optional[str] = None
 
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+def get_client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
 
     if request.client:
         return request.client.host
@@ -47,259 +51,204 @@ def client_ip(request: Request) -> str:
     return "unknown"
 
 
-def init_anticheat_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS log_anticheat (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            jugador_id INTEGER,
-            ip_address TEXT,
-            datos_enviados TEXT,
-            razon_rechazo TEXT,
-            timestamp TEXT NOT NULL
-        )
-        """
-    )
-    conn.commit()
-
-
-def log_rechazo(
-    conn: sqlite3.Connection,
-    jugador_id: int,
+@router.post("/start", response_model=StartGameResponse)
+async def start_game(
     request: Request,
-    datos: Dict,
-    razon: str,
-) -> None:
-    init_anticheat_table(conn)
+    current_user: dict = Depends(require_role("jugador")),
+):
+    """
+    Crea una sesión de partida para el jugador autenticado.
 
-    conn.execute(
+    El jugador se toma exclusivamente del JWT.
+    """
+
+    session_token = uuid4()
+    player_id = current_user["id"]
+    ip_address = get_client_ip(request)
+
+    await execute(
         """
-        INSERT INTO log_anticheat (
-            jugador_id,
-            ip_address,
-            datos_enviados,
-            razon_rechazo,
-            timestamp
-        )
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO partidas(session_token, jugador_id)
+        VALUES($1, $2)
         """,
-        (
-            jugador_id,
-            client_ip(request),
-            json.dumps(datos, ensure_ascii=False),
-            razon,
-            now_iso(),
-        ),
+        session_token,
+        player_id,
     )
-    conn.commit()
+
+    log_security_event(
+        event_type="game_session_started",
+        ip_address=ip_address,
+        user_id=player_id,
+        role=current_user["role"],
+        success=True,
+        reason="session_created",
+        extra={"session_token_prefix": str(session_token)[:8]},
+    )
+
+    return StartGameResponse(
+        session_token=str(session_token),
+        message="Partida iniciada correctamente.",
+    )
 
 
-def parse_datetime(value) -> datetime:
-    """
-    Convierte started_at a datetime.
-    Soporta fechas ISO y valores numéricos heredados.
-    """
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value, tz=timezone.utc)
-
-    text = str(value)
-
-    try:
-        return datetime.fromisoformat(text)
-    except ValueError:
-        try:
-            return datetime.fromtimestamp(float(text), tz=timezone.utc)
-        except ValueError:
-            return datetime.now(timezone.utc)
-
-
-def calculate_score(body: EndGameBody) -> int:
-    """
-    Calcula el score en el backend.
-    El cliente NO envía score final, solo estadísticas limitadas.
-    """
-    base = body.level_reached * 1000
-    coins = body.coins_collected * 10
-    enemies = body.enemies_defeated * 50
-    time_bonus = body.time_remaining * 2
-
-    return base + coins + enemies + time_bonus
-
-
-@router.post("/start")
-def iniciar_partida(
-    payload: Dict = Depends(verify_role("JUGADOR")),
+@router.post("/score", status_code=status.HTTP_201_CREATED)
+async def register_score(
+    body: ScoreBody,
+    request: Request,
+    current_user: dict = Depends(require_role("jugador")),
 ):
     """
-    Crea una sesión de juego asociada al jugador autenticado.
+    Registra un puntaje de forma segura.
+
+    Reglas:
+    - Requiere JWT con rol jugador.
+    - El jugador se toma del token, nunca del body.
+    - El score debe estar entre 1 y MAX_SCORE_ALLOWED.
+    - Rate limit: máximo 1 puntaje por minuto por jugador.
+    - Si llega session_token, se valida ownership y uso único.
     """
-    jugador_id = int(payload.get("player_id") or payload.get("sub"))
-    session_token = str(uuid.uuid4())
 
-    conn = get_conn()
+    player_id = current_user["id"]
+    ip_address = get_client_ip(request)
 
-    try:
-        conn.execute(
-            """
-            INSERT INTO partidas (
-                session_token,
-                jugador_id,
-                started_at,
-                usado
-            )
-            VALUES (?, ?, ?, ?)
-            """,
-            (session_token, jugador_id, now_iso(), 0),
+    recent_scores = await fetchval(
+        """
+        SELECT COUNT(*)
+        FROM puntuaciones
+        WHERE jugador_id = $1
+          AND created_at >= NOW() - INTERVAL '1 minute'
+        """,
+        player_id,
+    )
+
+    if int(recent_scores or 0) >= 1:
+        log_security_event(
+            event_type="score_rate_limited",
+            ip_address=ip_address,
+            user_id=player_id,
+            role=current_user["role"],
+            success=False,
+            reason="score_rate_limit_1_per_minute",
         )
 
-        conn.commit()
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Solo puede registrar un puntaje por minuto.",
+        )
 
-        return {
-            "session_token": session_token
-        }
+    partida_id = None
 
-    finally:
-        conn.close()
+    if body.session_token:
+        try:
+            parsed_session = UUID(body.session_token)
+        except ValueError:
+            log_security_event(
+                event_type="score_rejected",
+                ip_address=ip_address,
+                user_id=player_id,
+                role=current_user["role"],
+                success=False,
+                reason="invalid_session_token_format",
+            )
 
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Session token inválido.",
+            )
 
-@router.post("/end")
-def registrar_puntuacion(
-    body: EndGameBody,
-    request: Request,
-    payload: Dict = Depends(verify_role("JUGADOR")),
-):
-    """
-    Registra la puntuación de una partida.
-
-    Controles anti-cheat:
-    - No acepta score enviado por el cliente.
-    - Verifica que la sesión exista.
-    - Verifica que la sesión pertenezca al jugador del JWT.
-    - Verifica que la sesión no haya sido usada.
-    - Valida duración máxima de sesión.
-    - Calcula score en backend.
-    - Registra rechazos en log_anticheat.
-    """
-    jugador_id = int(payload.get("player_id") or payload.get("sub"))
-
-    raw_body = body.model_dump()
-
-    conn = get_conn()
-
-    try:
-        partida = conn.execute(
+        partida = await fetchrow(
             """
-            SELECT
-                id,
-                usado,
-                jugador_id,
-                started_at
+            SELECT id, jugador_id, usado
             FROM partidas
-            WHERE session_token = ?
+            WHERE session_token = $1
             """,
-            (body.session_token,),
-        ).fetchone()
+            parsed_session,
+        )
 
         if not partida:
-            log_rechazo(
-                conn,
-                jugador_id,
-                request,
-                raw_body,
-                "session_token_inexistente",
-            )
             raise HTTPException(
-                status_code=400,
-                detail="Sesión inválida."
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Partida no encontrada.",
             )
 
-        if int(partida["jugador_id"]) != jugador_id:
-            log_rechazo(
-                conn,
-                jugador_id,
-                request,
-                raw_body,
-                "session_token_no_pertenece_al_jugador",
+        if int(partida["jugador_id"]) != int(player_id):
+            log_security_event(
+                event_type="score_rejected",
+                ip_address=ip_address,
+                user_id=player_id,
+                role=current_user["role"],
+                success=False,
+                reason="session_owner_mismatch",
+                extra={"target_player_id": int(partida["jugador_id"])},
             )
+
             raise HTTPException(
-                status_code=403,
-                detail="No tienes permiso para registrar esta sesión."
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No puede registrar puntajes para otra partida.",
             )
 
-        if bool(partida["usado"]):
-            log_rechazo(
-                conn,
-                jugador_id,
-                request,
-                raw_body,
-                "session_token_reutilizado",
-            )
+        if partida["usado"]:
             raise HTTPException(
-                status_code=400,
-                detail="La sesión ya fue registrada."
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="La partida ya fue usada para registrar puntaje.",
             )
 
-        started_at = parse_datetime(partida["started_at"])
-        session_age = datetime.now(timezone.utc) - started_at
+        partida_id = partida["id"]
 
-        if session_age > timedelta(minutes=MAX_SESSION_MINUTES):
-            log_rechazo(
-                conn,
-                jugador_id,
-                request,
-                raw_body,
-                "session_expirada",
-            )
-            raise HTTPException(
-                status_code=400,
-                detail="La sesión expiró."
-            )
-
-        calculated_score = calculate_score(body)
-
-        conn.execute(
-            """
-            INSERT INTO puntuaciones (
-                jugador_id,
-                partida_id,
-                score,
-                level_reached,
-                coins_collected,
-                time_remaining,
-                estado,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                jugador_id,
-                partida["id"],
-                calculated_score,
-                body.level_reached,
-                body.coins_collected,
-                body.time_remaining,
-                "valida",
-                now_iso(),
-            ),
-        )
-
-        conn.execute(
+        await execute(
             """
             UPDATE partidas
-            SET usado = ?,
-                ended_at = ?
-            WHERE id = ?
+            SET usado = TRUE, ended_at = NOW()
+            WHERE id = $1
             """,
-            (1, now_iso(), partida["id"]),
+            partida_id,
         )
 
-        conn.commit()
+    row = await fetchrow(
+        """
+        INSERT INTO puntuaciones(jugador_id, partida_id, score, level_reached, estado)
+        VALUES($1, $2, $3, $4, 'valida')
+        RETURNING id, jugador_id, score, level_reached, estado, created_at
+        """,
+        player_id,
+        partida_id,
+        body.score,
+        body.level_reached,
+    )
 
-        return {
-            "mensaje": "Puntuación registrada.",
-            "score": calculated_score,
+    log_security_event(
+        event_type="score_registered",
+        ip_address=ip_address,
+        user_id=player_id,
+        role=current_user["role"],
+        success=True,
+        reason="score_saved",
+        extra={
+            "score": body.score,
             "level_reached": body.level_reached,
-        }
+            "partida_id": partida_id,
+        },
+    )
 
-    finally:
-        conn.close()
+    return {
+        "message": "Puntaje registrado correctamente.",
+        "score": {
+            "id": row["id"],
+            "score": row["score"],
+            "level_reached": row["level_reached"],
+            "estado": row["estado"],
+            "created_at": str(row["created_at"]),
+        },
+    }
+
+
+@router.post("/end", status_code=status.HTTP_201_CREATED)
+async def end_game(
+    body: ScoreBody,
+    request: Request,
+    current_user: dict = Depends(require_role("jugador")),
+):
+    """
+    Alias de compatibilidad para clientes que llamen /game/end.
+    """
+    return await register_score(body, request, current_user)
