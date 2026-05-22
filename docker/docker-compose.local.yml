@@ -1,0 +1,23 @@
+services:
+  pixelforge-db:
+    image: postgres:16-alpine
+    container_name: pixelforge-final-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pixelforge_final_db
+      POSTGRES_USER: game_app
+      POSTGRES_PASSWORD: PixelForge_Final_DB_2026*
+    ports:
+      - "5433:5432"
+    volumes:
+      - pixelforge_final_pgdata:/var/lib/postgresql/data
+      - ../database/final_schema.sql:/docker-entrypoint-initdb.d/01_final_schema.sql:ro
+    networks:
+      - pixelforge-final-net
+
+networks:
+  pixelforge-final-net:
+    driver: bridge
+
+volumes:
+  pixelforge_final_pgdata:
