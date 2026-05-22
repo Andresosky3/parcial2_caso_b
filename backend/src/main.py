@@ -10,6 +10,7 @@ from src.auth.router import router as auth_router
 from src.db import connect_db, disconnect_db, fetchval
 from src.game.router import router as game_router
 from src.leaderboard.router import router as leaderboard_router
+from src.payments.router import router as payments_router
 from src.settings import get_settings
 
 
@@ -73,3 +74,4 @@ app.include_router(auth_router)
 app.include_router(game_router)
 app.include_router(leaderboard_router)
 app.include_router(admin_router)
+app.include_router(payments_router)
