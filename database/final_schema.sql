@@ -9,6 +9,9 @@ CREATE TABLE IF NOT EXISTS jugadores (
     mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     mfa_method VARCHAR(20),
     mfa_secret_hash VARCHAR(255),
+    mfa_secret_encrypted TEXT,
+    mfa_enabled_at TIMESTAMP,
+    mfa_last_verified_at TIMESTAMP,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     last_login TIMESTAMP
 );

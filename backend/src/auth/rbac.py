@@ -1,5 +1,6 @@
 """RBAC y validación de usuario autenticado para PixelForge Studio."""
 
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Union
 
 from fastapi import Depends, Header, HTTPException, status
@@ -122,7 +123,10 @@ async def get_current_user(
     return build_current_user_from_payload(payload)
 
 
-def role_has_permission(current_role: Optional[str], allowed_roles: Union[str, Iterable[str]]) -> bool:
+def role_has_permission(
+    current_role: Optional[str],
+    allowed_roles: Union[str, Iterable[str]],
+) -> bool:
     """Evalúa si el rol actual tiene permiso según jerarquía."""
     normalized_current = normalize_role(current_role)
     normalized_allowed = set(normalize_allowed_roles(allowed_roles))
@@ -141,19 +145,19 @@ def verify_role(
 
     Compatible con dos usos:
 
-    1. Forma vieja del parcial anterior:
+    1. Forma vieja:
        payload: Dict = Depends(verify_role("MODERADOR"))
 
     2. Forma directa:
        verify_role(current_user, ["admin_juego", "moderador"])
     """
 
-    # Forma vieja / dependencia FastAPI:
-    # Depends(verify_role("MODERADOR"))
     if allowed_roles is None:
         required_roles = payload_or_allowed_roles
 
-        async def dependency(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+        async def dependency(
+            authorization: Optional[str] = Header(default=None),
+        ) -> Dict[str, Any]:
             current_user = decode_authorization_header(authorization)
 
             if not role_has_permission(current_user.get("role"), required_roles):
@@ -166,8 +170,6 @@ def verify_role(
 
         return dependency
 
-    # Forma directa:
-    # verify_role(current_user, ["moderador"])
     current_user = payload_or_allowed_roles
 
     if not isinstance(current_user, dict):
@@ -185,21 +187,6 @@ def verify_role(
     return True
 
 
-def require_role(allowed_roles: Union[str, Iterable[str]]):
-    """
-    Dependencia moderna para proteger endpoints por rol.
-
-    Uso:
-        current_user: dict = Depends(require_role(["admin_juego"]))
-    """
-
-    async def dependency(current_user: Dict[str, Any] = Depends(get_current_user)):
-        verify_role(current_user, allowed_roles)
-        return current_user
-
-    return dependency
-
-
 def require_mfa_verified(current_user: Dict[str, Any]) -> None:
     """Bloquea tokens parciales que todavía no completaron MFA."""
     if current_user.get("token_type") == "partial" or not current_user.get("mfa_verified", False):
@@ -207,6 +194,54 @@ def require_mfa_verified(current_user: Dict[str, Any]) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Debe completar la verificación MFA.",
         )
+
+
+def require_role(allowed_roles: Union[str, Iterable[str]], require_mfa: bool = True):
+    """
+    Dependencia moderna para proteger endpoints por rol.
+
+    Por defecto exige MFA completo.
+
+    Además, si el usuario activó MFA después de emitir un token viejo,
+    ese token se rechaza para acciones protegidas.
+    """
+
+    async def dependency(current_user: Dict[str, Any] = Depends(get_current_user)):
+        verify_role(current_user, allowed_roles)
+
+        if require_mfa:
+            require_mfa_verified(current_user)
+
+            from src.db import fetchrow
+
+            user_mfa = await fetchrow(
+                """
+                SELECT mfa_enabled, mfa_enabled_at
+                FROM jugadores
+                WHERE id = $1
+                """,
+                current_user["id"],
+            )
+
+            if user_mfa and user_mfa["mfa_enabled"] and user_mfa["mfa_enabled_at"]:
+                token_iat = current_user["payload"].get("iat")
+
+                if token_iat:
+                    token_issued_at = datetime.utcfromtimestamp(int(token_iat))
+                    mfa_enabled_at = user_mfa["mfa_enabled_at"]
+
+                    if token_issued_at < mfa_enabled_at:
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail=(
+                                "Token emitido antes de activar MFA. "
+                                "Inicie sesión nuevamente y complete MFA."
+                            ),
+                        )
+
+        return current_user
+
+    return dependency
 
 
 def require_self_or_role(
@@ -236,7 +271,9 @@ def require_self_or_role(
     )
 
 
-def require_authorization_header(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+def require_authorization_header(
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
     """
     Compatibilidad con routers que todavía reciben Authorization manualmente.
     """

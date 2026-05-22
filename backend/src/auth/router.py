@@ -1,13 +1,21 @@
 """Rutas de autenticación para PixelForge Studio — Examen Final."""
 
 from datetime import datetime, timedelta
-
 from typing import Optional
 
 from asyncpg import UniqueViolationError
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
+from src.auth.mfa_service import (
+    build_provisioning_uri,
+    decrypt_mfa_secret,
+    encrypt_mfa_secret,
+    generate_qr_png_base64,
+    generate_totp_secret,
+    verify_totp_code,
+)
+from src.auth.rbac import require_role
 from src.auth.service import create_token, hash_password, verify_password
 from src.db import execute, fetchrow, fetchval
 from src.security_logger import log_security_event
@@ -50,6 +58,10 @@ class LoginBody(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
+class MfaCodeBody(BaseModel):
+    code: str = Field(min_length=6, max_length=8)
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -60,7 +72,6 @@ class TokenResponse(BaseModel):
 
 
 def get_client_ip(request: Request) -> str:
-    """Obtiene IP del cliente, considerando proxy si existe."""
     forwarded_for = request.headers.get("x-forwarded-for")
     if forwarded_for:
         return forwarded_for.split(",")[0].strip()
@@ -72,7 +83,6 @@ def get_client_ip(request: Request) -> str:
 
 
 async def count_recent_failed_attempts(email: str, ip_address: str) -> int:
-    """Cuenta fallos recientes por email o IP en ventana de bloqueo."""
     since = datetime.utcnow() - timedelta(minutes=LOCKOUT_MINUTES)
 
     count = await fetchval(
@@ -97,7 +107,6 @@ async def register_login_attempt(
     success: bool,
     reason: Optional[str] = None,
 ) -> None:
-    """Guarda intento de login en PostgreSQL."""
     await execute(
         """
         INSERT INTO login_attempts(email, ip_address, success, reason)
@@ -110,10 +119,20 @@ async def register_login_attempt(
     )
 
 
+def build_auth_token(user_id: int, role: str, mfa_verified: bool, token_type: str) -> str:
+    return create_token(
+        {
+            "player_id": user_id,
+            "sub": str(user_id),
+            "role": role,
+            "mfa_verified": mfa_verified,
+            "token_type": token_type,
+        }
+    )
+
+
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 async def register(body: RegisterBody, request: Request):
-    """Registra un jugador usando PostgreSQL y bcrypt."""
-
     ip_address = get_client_ip(request)
 
     try:
@@ -165,7 +184,6 @@ async def register(body: RegisterBody, request: Request):
             reason="nickname_or_email_duplicated",
         )
 
-        # Mensaje genérico para evitar enumeración de usuarios.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No fue posible completar el registro.",
@@ -180,8 +198,6 @@ async def register(body: RegisterBody, request: Request):
 
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginBody, request: Request):
-    """Login de jugador con bloqueo temporal por intentos fallidos."""
-
     ip_address = get_client_ip(request)
     email = body.email.lower()
 
@@ -221,20 +237,13 @@ async def login(body: LoginBody, request: Request):
         email,
     )
 
-    # Mensaje genérico: no revela si el usuario existe o si falló la contraseña.
     invalid_credentials_error = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Credenciales inválidas.",
     )
 
     if not user:
-        await register_login_attempt(
-            email=email,
-            ip_address=ip_address,
-            success=False,
-            reason="invalid_credentials",
-        )
-
+        await register_login_attempt(email, ip_address, False, "invalid_credentials")
         log_security_event(
             event_type="login_failed",
             ip_address=ip_address,
@@ -242,17 +251,10 @@ async def login(body: LoginBody, request: Request):
             success=False,
             reason="invalid_credentials",
         )
-
         raise invalid_credentials_error
 
     if user["estado"] != "activo":
-        await register_login_attempt(
-            email=email,
-            ip_address=ip_address,
-            success=False,
-            reason="inactive_account",
-        )
-
+        await register_login_attempt(email, ip_address, False, "inactive_account")
         log_security_event(
             event_type="login_failed",
             ip_address=ip_address,
@@ -262,17 +264,10 @@ async def login(body: LoginBody, request: Request):
             success=False,
             reason="inactive_account",
         )
-
         raise invalid_credentials_error
 
     if not verify_password(body.password, user["password_hash"]):
-        await register_login_attempt(
-            email=email,
-            ip_address=ip_address,
-            success=False,
-            reason="invalid_credentials",
-        )
-
+        await register_login_attempt(email, ip_address, False, "invalid_credentials")
         log_security_event(
             event_type="login_failed",
             ip_address=ip_address,
@@ -282,15 +277,9 @@ async def login(body: LoginBody, request: Request):
             success=False,
             reason="invalid_credentials",
         )
-
         raise invalid_credentials_error
 
-    await register_login_attempt(
-        email=email,
-        ip_address=ip_address,
-        success=True,
-        reason="login_success",
-    )
+    await register_login_attempt(email, ip_address, True, "login_success")
 
     await execute(
         """
@@ -299,6 +288,17 @@ async def login(body: LoginBody, request: Request):
         WHERE id = $1
         """,
         user["id"],
+    )
+
+    mfa_required = bool(user["mfa_enabled"])
+    token_type = "partial" if mfa_required else "access"
+    mfa_verified = not mfa_required
+
+    token = build_auth_token(
+        user_id=user["id"],
+        role=user["role"],
+        mfa_verified=mfa_verified,
+        token_type=token_type,
     )
 
     log_security_event(
@@ -310,20 +310,9 @@ async def login(body: LoginBody, request: Request):
         success=True,
         reason="credentials_valid",
         extra={
-            "mfa_enabled": bool(user["mfa_enabled"]),
+            "mfa_required": mfa_required,
+            "token_type": token_type,
         },
-    )
-
-    # En la siguiente fase, si mfa_enabled=True emitiremos token parcial.
-    # Por ahora se mantiene token completo para usuarios sin MFA.
-    token = create_token(
-        {
-            "player_id": user["id"],
-            "sub": str(user["id"]),
-            "role": user["role"],
-            "mfa_verified": not bool(user["mfa_enabled"]),
-            "token_type": "access",
-        }
     )
 
     return TokenResponse(
@@ -331,13 +320,231 @@ async def login(body: LoginBody, request: Request):
         expires_in_minutes=120,
         role=user["role"],
         user_id=user["id"],
-        mfa_required=bool(user["mfa_enabled"]),
+        mfa_required=mfa_required,
+    )
+
+
+@router.post("/mfa/setup")
+async def setup_mfa(
+    request: Request,
+    current_user: dict = Depends(require_role("jugador", require_mfa=False)),
+):
+    """
+    Genera secreto TOTP y QR para configurar MFA.
+    """
+
+    ip_address = get_client_ip(request)
+
+    user = await fetchrow(
+        """
+        SELECT id, email, role, mfa_enabled
+        FROM jugadores
+        WHERE id = $1
+        """,
+        current_user["id"],
+    )
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Usuario no encontrado.",
+        )
+
+    secret = generate_totp_secret()
+    encrypted_secret = encrypt_mfa_secret(secret)
+    provisioning_uri = build_provisioning_uri(secret, user["email"])
+    qr_base64 = generate_qr_png_base64(provisioning_uri)
+
+    await execute(
+        """
+        UPDATE jugadores
+        SET mfa_secret_encrypted = $1,
+            mfa_method = 'totp',
+            mfa_enabled = FALSE,
+            mfa_enabled_at = NULL,
+            mfa_last_verified_at = NULL
+        WHERE id = $2
+        """,
+        encrypted_secret,
+        user["id"],
+    )
+
+    log_security_event(
+        event_type="mfa_setup_started",
+        ip_address=ip_address,
+        user_email=user["email"],
+        user_id=user["id"],
+        role=user["role"],
+        success=True,
+        reason="totp_secret_generated",
+    )
+
+    return {
+        "message": "MFA preparado. Escanee el QR o use el secreto manual y confirme con /auth/mfa/enable.",
+        "method": "totp",
+        "issuer": "PixelForge Studio",
+        "secret_manual_entry": secret,
+        "provisioning_uri": provisioning_uri,
+        "qr_png_base64": qr_base64,
+    }
+
+
+@router.post("/mfa/enable")
+async def enable_mfa(
+    body: MfaCodeBody,
+    request: Request,
+    current_user: dict = Depends(require_role("jugador", require_mfa=False)),
+):
+    """
+    Activa MFA después de confirmar un código TOTP válido.
+    """
+
+    ip_address = get_client_ip(request)
+
+    user = await fetchrow(
+        """
+        SELECT id, email, role, mfa_secret_encrypted
+        FROM jugadores
+        WHERE id = $1
+        """,
+        current_user["id"],
+    )
+
+    if not user or not user["mfa_secret_encrypted"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Primero debe configurar MFA.",
+        )
+
+    secret = decrypt_mfa_secret(user["mfa_secret_encrypted"])
+
+    if not verify_totp_code(secret, body.code):
+        log_security_event(
+            event_type="mfa_enable_failed",
+            ip_address=ip_address,
+            user_email=user["email"],
+            user_id=user["id"],
+            role=user["role"],
+            success=False,
+            reason="invalid_totp_code",
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Código MFA inválido.",
+        )
+
+    await execute(
+        """
+        UPDATE jugadores
+        SET mfa_enabled = TRUE,
+            mfa_enabled_at = NOW(),
+            mfa_last_verified_at = NOW()
+        WHERE id = $1
+        """,
+        user["id"],
+    )
+
+    log_security_event(
+        event_type="mfa_enabled",
+        ip_address=ip_address,
+        user_email=user["email"],
+        user_id=user["id"],
+        role=user["role"],
+        success=True,
+        reason="totp_confirmed",
+    )
+
+    return {
+        "message": "MFA activado correctamente."
+    }
+
+
+@router.post("/mfa/verify", response_model=TokenResponse)
+async def verify_mfa(
+    body: MfaCodeBody,
+    request: Request,
+    current_user: dict = Depends(require_role("jugador", require_mfa=False)),
+):
+    """
+    Verifica MFA durante login y entrega token completo.
+    """
+
+    ip_address = get_client_ip(request)
+
+    user = await fetchrow(
+        """
+        SELECT id, email, role, mfa_enabled, mfa_secret_encrypted
+        FROM jugadores
+        WHERE id = $1
+        """,
+        current_user["id"],
+    )
+
+    if not user or not user["mfa_enabled"] or not user["mfa_secret_encrypted"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MFA no está activo para este usuario.",
+        )
+
+    secret = decrypt_mfa_secret(user["mfa_secret_encrypted"])
+
+    if not verify_totp_code(secret, body.code):
+        log_security_event(
+            event_type="mfa_verify_failed",
+            ip_address=ip_address,
+            user_email=user["email"],
+            user_id=user["id"],
+            role=user["role"],
+            success=False,
+            reason="invalid_totp_code",
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Código MFA inválido.",
+        )
+
+    await execute(
+        """
+        UPDATE jugadores
+        SET mfa_last_verified_at = NOW()
+        WHERE id = $1
+        """,
+        user["id"],
+    )
+
+    token = build_auth_token(
+        user_id=user["id"],
+        role=user["role"],
+        mfa_verified=True,
+        token_type="access",
+    )
+
+    log_security_event(
+        event_type="mfa_verified",
+        ip_address=ip_address,
+        user_email=user["email"],
+        user_id=user["id"],
+        role=user["role"],
+        success=True,
+        reason="totp_valid",
+    )
+
+    return TokenResponse(
+        access_token=token,
+        expires_in_minutes=120,
+        role=user["role"],
+        user_id=user["id"],
+        mfa_required=False,
     )
 
 
 @router.get("/me")
-async def me():
-    """Endpoint reservado para completar perfil autenticado en fases posteriores."""
+async def me(current_user: dict = Depends(require_role("jugador"))):
     return {
-        "message": "Perfil autenticado pendiente de integración con RBAC final."
+        "id": current_user["id"],
+        "role": current_user["role"],
+        "mfa_verified": current_user["mfa_verified"],
+        "token_type": current_user["token_type"],
     }
